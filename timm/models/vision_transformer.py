@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.jit import Final
+from torch.cuda.amp import custom_fwd, custom_bwd
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
@@ -52,6 +53,24 @@ __all__ = ['VisionTransformer']  # model_registry will add each entrypoint fn to
 
 
 _logger = logging.getLogger(__name__)
+
+
+class MaskedAttnV(torch.autograd.Function):
+    @staticmethod
+    @custom_fwd
+    def forward(ctx, attn, v, mask):  # Mask as input
+        ctx.save_for_backward(attn, v, mask)
+        return attn @ v
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        attn, v, mask = ctx.saved_tensors  # Retrieve mask
+
+        grad_attn = grad_output @ v.transpose(-2, -1)
+        grad_v = torch.where(mask, attn, torch.zeros_like(attn)).transpose(-2, -1) @ grad_output
+        # No gradient for the mask itself (assuming it's pre-defined)
+        return grad_attn, grad_v, None
 
 
 class Attention(nn.Module):
@@ -81,13 +100,13 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None, bwd_mask: torch.Tensor = None) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        if self.fused_attn:
+        if self.fused_attn and bwd_mask is None:
             x = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask,
                 dropout_p=self.attn_drop.p if self.training else 0.,
@@ -97,7 +116,10 @@ class Attention(nn.Module):
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
-            x = attn @ v
+            if bwd_mask is None:
+                x = attn @ v
+            else:
+                x = MaskedAttnV.apply(attn, v, bwd_mask)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -160,8 +182,8 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), mask)))
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, bwd_mask: torch.Tensor = None) -> torch.Tensor:
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), mask, bwd_mask)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
 
